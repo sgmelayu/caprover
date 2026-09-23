@@ -3,19 +3,28 @@ import ApiStatusCodes from '../../api/ApiStatusCodes'
 import DataStore from '../../datastore/DataStore'
 import DataStoreProvider from '../../datastore/DataStoreProvider'
 import DockerApi from '../../docker/DockerApi'
+import { GoAccessInfo } from '../../models/GoAccessInfo'
 import { IRegistryInfo, IRegistryTypes } from '../../models/IRegistryInfo'
+import { NetDataInfo } from '../../models/NetDataInfo'
 import CaptainConstants from '../../utils/CaptainConstants'
+import { getText } from '../../utils/HttpUtils'
 import Logger from '../../utils/Logger'
-import MigrateCaptainDuckDuck from '../../utils/MigrateCaptainDuckDuck'
 import Utils from '../../utils/Utils'
 import Authenticator from '../Authenticator'
+import FeatureFlags from '../FeatureFlags'
 import ServiceManager from '../ServiceManager'
+import { EventLoggerFactory } from '../events/EventLogger'
+import {
+    CapRoverEventFactory,
+    CapRoverEventType,
+} from '../events/ICapRoverEvent'
+import ProManager from '../pro/ProManager'
 import BackupManager from './BackupManager'
 import CertbotManager from './CertbotManager'
+import DiskCleanupManager from './DiskCleanupManager'
 import DomainResolveChecker from './DomainResolveChecker'
 import LoadBalancerManager from './LoadBalancerManager'
 import SelfHostedDockerRegistry from './SelfHostedDockerRegistry'
-import request = require('request')
 import fs = require('fs-extra')
 
 const DEBUG_SALT = 'THIS IS NOT A REAL CERTIFICATE'
@@ -34,6 +43,7 @@ class CaptainManager {
     private certbotManager: CertbotManager
     private loadBalancerManager: LoadBalancerManager
     private domainResolveChecker: DomainResolveChecker
+    private diskCleanupManager: DiskCleanupManager
     private dockerRegistry: SelfHostedDockerRegistry
     private backupManager: BackupManager
     private myNodeId: string | undefined
@@ -60,6 +70,10 @@ class CaptainManager {
         this.domainResolveChecker = new DomainResolveChecker(
             this.loadBalancerManager,
             this.certbotManager
+        )
+        this.diskCleanupManager = new DiskCleanupManager(
+            this.dataStore,
+            dockerApi
         )
         this.myNodeId = undefined
         this.inited = false
@@ -132,11 +146,15 @@ class CaptainManager {
                 return fs.ensureFile(CaptainConstants.baseNginxConfigPath)
             })
             .then(function () {
+                return fs.ensureDir(CaptainConstants.nginxSharedLogsPathOnHost)
+            })
+            .then(function () {
                 return fs.ensureDir(CaptainConstants.registryPathOnHost)
             })
             .then(function () {
                 return dockerApi.ensureOverlayNetwork(
-                    CaptainConstants.captainNetworkName
+                    CaptainConstants.captainNetworkName,
+                    CaptainConstants.configs.overlayNetworkOverride
                 )
             })
             .then(function () {
@@ -199,18 +217,6 @@ class CaptainManager {
                 return dataStore.setEncryptionSalt(self.getCaptainSalt())
             })
             .then(function () {
-                return new MigrateCaptainDuckDuck(
-                    dataStore,
-                    Authenticator.getAuthenticator(dataStore.getNameSpace())
-                )
-                    .migrateIfNeeded()
-                    .then(function (migrationPerformed) {
-                        if (!!migrationPerformed) {
-                            return self.resetSelf()
-                        }
-                    })
-            })
-            .then(function () {
                 return loadBalancerManager.init(myNodeId, dataStore)
             })
             .then(function () {
@@ -226,7 +232,7 @@ class CaptainManager {
                     }
                 }
 
-                if (!!localRegistry) {
+                if (localRegistry) {
                     Logger.d('Ensuring Docker Registry is running...')
                     return self.dockerRegistry.ensureDockerRegistryRunningOnThisNode(
                         localRegistry.registryPassword
@@ -244,9 +250,33 @@ class CaptainManager {
                 )
             })
             .then(function () {
+                return self.diskCleanupManager.init()
+            })
+            .then(function () {
+                return self.dataStore.getGoAccessInfo()
+            })
+            .then(function (goAccessInfo) {
+                // Ensure GoAccess container restart
+                return self.updateGoAccessInfo(goAccessInfo)
+            })
+            .then(function () {
                 self.inited = true
 
                 self.performHealthCheck()
+
+                EventLoggerFactory.get(
+                    new ProManager(
+                        self.dataStore.getProDataStore(),
+                        FeatureFlags.get(self.dataStore)
+                    )
+                )
+                    .getLogger()
+                    .trackEvent(
+                        CapRoverEventFactory.create(
+                            CapRoverEventType.InstanceStarted,
+                            {}
+                        )
+                    )
 
                 Logger.d(
                     '**** Captain is initialized and ready to serve you! ****'
@@ -309,22 +339,26 @@ class CaptainManager {
 
             const url = `http://${captainPublicDomain}${CaptainConstants.healthCheckEndPoint}`
 
-            request(
-                url,
-
-                function (error, response, body) {
+            getText(url)
+                .then(function (body) {
                     if (callbackCalled) {
                         return
                     }
                     callbackCalled = true
 
-                    if (error || !body || body !== self.getHealthCheckUuid()) {
+                    if (!body || body !== self.getHealthCheckUuid()) {
                         callback(false)
                     } else {
                         callback(true)
                     }
-                }
-            )
+                })
+                .catch(function () {
+                    if (callbackCalled) {
+                        return
+                    }
+                    callbackCalled = true
+                    callback(false)
+                })
         }
 
         function checkNginxHealth(callback: ISuccessCallback) {
@@ -434,6 +468,10 @@ class CaptainManager {
         return this.certbotManager
     }
 
+    getDiskCleanupManager() {
+        return this.diskCleanupManager
+    }
+
     isInitialized() {
         return (
             this.inited &&
@@ -458,6 +496,12 @@ class CaptainManager {
                     self.dataStore,
                     self.dockerApi,
                     CaptainManager.get().getLoadBalanceManager(),
+                    EventLoggerFactory.get(
+                        new ProManager(
+                            self.dataStore.getProDataStore(),
+                            FeatureFlags.get(self.dataStore)
+                        )
+                    ).getLogger(),
                     CaptainManager.get().getDomainResolveChecker()
                 )
                 Object.keys(apps).forEach((appName) => {
@@ -535,6 +579,10 @@ class CaptainManager {
 
                     if (netDataInfo.data.smtp) {
                         envVars.push({
+                            key: 'SMTP_FROM',
+                            value: netDataInfo.data.smtp.username,
+                        })
+                        envVars.push({
                             key: 'SSMTP_TO',
                             value: netDataInfo.data.smtp.to,
                         })
@@ -556,8 +604,8 @@ class CaptainManager {
                         envVars.push({
                             key: 'SSMTP_TLS',
                             value: netDataInfo.data.smtp.allowNonTls
-                                ? 'NO'
-                                : 'YES',
+                                ? 'off'
+                                : 'on',
                         })
 
                         envVars.push({
@@ -568,6 +616,24 @@ class CaptainManager {
                         envVars.push({
                             key: 'SSMTP_PASS',
                             value: netDataInfo.data.smtp.password,
+                        })
+
+                        // See: https://github.com/titpetric/netdata#changelog
+                        const otherEnvVars: any[] = []
+                        envVars.forEach((e) => {
+                            otherEnvVars.push({
+                                // change SSMTP to SMTP
+                                key: e.key.replace('SSMTP_', 'SMTP_'),
+                                value: e.value,
+                            })
+                        })
+                        envVars.push(...otherEnvVars)
+
+                        envVars.push({
+                            key: 'SMTP_STARTTLS',
+                            value: netDataInfo.data.smtp.allowNonTls
+                                ? ''
+                                : 'on',
                         })
                     }
 
@@ -624,6 +690,87 @@ class CaptainManager {
             })
     }
 
+    updateGoAccessInfo(goAccessInfo: GoAccessInfo) {
+        const self = this
+        const dockerApi = this.dockerApi
+        const enabled = goAccessInfo.isEnabled
+
+        // Validate cron schedules
+        if (!Utils.validateCron(goAccessInfo.data.rotationFrequencyCron)) {
+            throw ApiStatusCodes.createError(
+                ApiStatusCodes.ILLEGAL_PARAMETER,
+                'Invalid cron schedule'
+            )
+        }
+
+        const crontabFilePath = `${
+            CaptainConstants.goaccessConfigPathBase
+        }/crontab.txt`
+
+        return Promise.resolve()
+            .then(function () {
+                return self.dataStore.setGoAccessInfo(goAccessInfo)
+            })
+            .then(function () {
+                const cronFile = [
+                    `${goAccessInfo.data.rotationFrequencyCron} /processLogs.sh`,
+                ].join('\n')
+
+                return fs.outputFile(crontabFilePath, cronFile)
+            })
+            .then(function () {
+                return dockerApi.ensureContainerStoppedAndRemoved(
+                    CaptainConstants.goAccessContainerName,
+                    CaptainConstants.captainNetworkName
+                )
+            })
+            .then(function () {
+                if (enabled) {
+                    return dockerApi.createStickyContainer(
+                        CaptainConstants.goAccessContainerName,
+                        CaptainConstants.configs.goAccessImageName,
+                        [
+                            {
+                                hostPath:
+                                    CaptainConstants.nginxSharedLogsPathOnHost,
+                                containerPath:
+                                    CaptainConstants.nginxSharedLogsPath,
+                                mode: 'rw',
+                            },
+                            {
+                                hostPath: crontabFilePath,
+                                containerPath:
+                                    CaptainConstants.goAccessCrontabPath,
+                                mode: 'ro',
+                            },
+                        ],
+                        CaptainConstants.captainNetworkName,
+                        [
+                            {
+                                key: 'LOG_RETENTION_DAYS',
+                                value: (
+                                    goAccessInfo.data.logRetentionDays ?? 180
+                                ).toString(),
+                            },
+                            {
+                                key: 'ANONYMIZE_IP',
+                                value: CaptainConstants.configs.goAccessAnonymizeIP.toString(),
+                            },
+                        ],
+                        [],
+                        ['apparmor:unconfined'],
+                        undefined
+                    )
+                }
+            })
+            .then(function () {
+                Logger.d(
+                    'Updating Load Balancer - CaptainManager.updateGoAccess'
+                )
+                return self.loadBalancerManager.rePopulateNginxConfigFile()
+            })
+    }
+
     getNodesInfo() {
         const dockerApi = this.dockerApi
 
@@ -672,9 +819,7 @@ class CaptainManager {
             })
             .then(function () {
                 Logger.d('Updating Load Balancer - CaptainManager.enableSsl')
-                return self.loadBalancerManager.rePopulateNginxConfigFile(
-                    self.dataStore
-                )
+                return self.loadBalancerManager.rePopulateNginxConfigFile()
             })
     }
 
@@ -723,12 +868,47 @@ class CaptainManager {
 
     setNginxConfig(baseConfig: string, captainConfig: string) {
         const self = this
+        let existingConfigs: {
+            baseConfig: {
+                byDefault: string
+                customValue: any
+            }
+            captainConfig: {
+                byDefault: string
+                customValue: any
+            }
+        }
         return Promise.resolve()
             .then(function () {
+                return self.dataStore.getNginxConfig()
+            })
+            .then(function (configs) {
+                existingConfigs = configs
                 return self.dataStore.setNginxConfig(baseConfig, captainConfig)
             })
             .then(function () {
-                self.resetSelf()
+                return self.loadBalancerManager.rePopulateNginxConfigFile()
+            })
+            .catch(function (error) {
+                if (
+                    error &&
+                    error.captainErrorType ===
+                        ApiStatusCodes.STATUS_ERROR_NGINX_VALIDATION_FAILED
+                ) {
+                    Logger.d(
+                        "Nginx validation failed. Reverting changes in system's nginx configs..."
+                    )
+                    self.dataStore
+                        .setNginxConfig(
+                            existingConfigs.baseConfig.customValue,
+                            existingConfigs.captainConfig.customValue
+                        )
+
+                        .then(function () {
+                            return self.loadBalancerManager.rePopulateNginxConfigFile()
+                        })
+                }
+                throw error
             })
     }
 
@@ -738,7 +918,7 @@ class CaptainManager {
         // We still allow users to specify the domains in their DNS settings individually
         // SubDomains that need to be added are "captain." "registry." "app-name."
         const url = `${uuid()}.${requestedCustomDomain}:${
-            CaptainConstants.nginxPortNumber
+            CaptainConstants.configs.nginxPortNumber80
         }`
 
         return self.domainResolveChecker
@@ -786,7 +966,7 @@ class CaptainManager {
                     }
                 }
 
-                if (!!localRegistry) {
+                if (localRegistry) {
                     throw ApiStatusCodes.createError(
                         ApiStatusCodes.ILLEGAL_OPERATION,
                         'Delete your self-hosted Docker registry before changing the domain.'
@@ -802,9 +982,7 @@ class CaptainManager {
                 Logger.d(
                     'Updating Load Balancer - CaptainManager.changeCaptainRootDomain'
                 )
-                return self.loadBalancerManager.rePopulateNginxConfigFile(
-                    self.dataStore
-                )
+                return self.loadBalancerManager.rePopulateNginxConfigFile()
             })
     }
 
